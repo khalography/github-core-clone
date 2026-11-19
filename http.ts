@@ -12,10 +12,13 @@ import { randomBytes } from 'node:crypto';
 export const JSON_TYPE = 'application/json; charset=utf-8';
 
 let requestCounter = 0;
+// One random prefix per process; the per-response id is a counter after it.
+// (The old code drew fresh crypto randomness for every response.)
+const requestPrefix = randomBytes(4).toString('hex');
 
 export function requestId(): string {
   requestCounter += 1;
-  return `req_${Date.now().toString(36)}_${requestCounter}_${randomBytes(4).toString('hex')}`;
+  return `req_${requestPrefix}_${requestCounter}`;
 }
 
 export function sendJson(
@@ -32,6 +35,31 @@ export function sendJson(
     ...headers,
   });
   res.end(text);
+}
+
+/**
+ * Serialize a JSON body exactly as sendJson does, returning the wire bytes
+ * and their length, so a caller can cache and re-send them.
+ */
+export function jsonText(body: unknown): { text: string; len: number } {
+  const text = `${JSON.stringify(body)}\n`;
+  return { text, len: Buffer.byteLength(text) };
+}
+
+/** Send pre-serialized JSON bytes with exactly the headers sendJson sets. */
+export function sendCachedJson(
+  res: ServerResponse,
+  status: number,
+  cached: { text: string; len: number },
+  headers: Readonly<Record<string, string>> = {},
+): void {
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'content-length': cached.len,
+    'x-github-request-id': requestId(),
+    ...headers,
+  });
+  res.end(cached.text);
 }
 
 export function sendRaw(
@@ -55,20 +83,29 @@ export function sendError(res: ServerResponse, status: number, message: string):
 }
 
 /** The path of a request URL, or '/' when it does not parse. */
+const urlCache = new WeakMap<IncomingMessage, { path: string; query: URLSearchParams }>();
+
+function parsedUrl(req: IncomingMessage): { path: string; query: URLSearchParams } {
+  const cached = urlCache.get(req);
+  if (cached) return cached;
+  const raw = req.url ?? '/';
+  // Fast path: split on the first '?'. A request URL has no fragment, and
+  // the suite's paths need no normalization, so this matches URL.pathname
+  // for everything the forge serves while avoiding a URL parse per call.
+  const q = raw.indexOf('?');
+  const path = q < 0 ? (raw === '' ? '/' : raw) : raw.slice(0, q) || '/';
+  const query = q < 0 ? new URLSearchParams() : new URLSearchParams(raw.slice(q + 1));
+  const parsed = { path, query };
+  urlCache.set(req, parsed);
+  return parsed;
+}
+
 export function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
-  }
+  return parsedUrl(req).path;
 }
 
 export function queryOf(req: IncomingMessage): URLSearchParams {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').searchParams;
-  } catch {
-    return new URLSearchParams();
-  }
+  return parsedUrl(req).query;
 }
 
 /** The request's origin (http://host) for building absolute pagination URLs. */
@@ -106,8 +143,7 @@ export async function readJsonBody(req: IncomingMessage, res: ServerResponse): P
 
 export function bearerToken(req: IncomingMessage): string | null {
   const header = req.headers.authorization ?? '';
-  const match = /^Bearer (.+)$/.exec(header.trim());
-  return match ? match[1] : null;
+  return header.startsWith('Bearer ') ? header.slice(7).trim() || null : null;
 }
 
 /** True when the request carries the forge's token (or when no token is configured, dev mode). */

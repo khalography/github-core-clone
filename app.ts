@@ -18,7 +18,7 @@ import { handleGit } from './githttp.ts';
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       try {
         const path = pathOf(req);
@@ -46,4 +46,9 @@ export function createApp(): Server {
       }
     })();
   });
+  // Every reply is a single small write; disable Nagle so it goes out at
+  // once instead of waiting for the peer's ACK (the timed workloads are
+  // sequential request/response pairs on keep-alive connections).
+  server.on('connection', (socket) => socket.setNoDelay(true));
+  return server;
 }

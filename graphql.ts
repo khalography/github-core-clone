@@ -13,6 +13,7 @@ import {
   VIEWER_ID,
   VIEWER_LOGIN,
   VIEWER_NAME,
+  bumpIssueVersion,
   nowIso,
   store,
   viewerUser,
@@ -640,6 +641,7 @@ function resolveMutationField(_value: GqlValue, field: FieldNode, ctx: ExecConte
       closedAt: null,
     };
     repo.issues.set(issue.number, issue);
+    bumpIssueVersion(repo);
     const gql: GqlValue = { __type: 'Issue', repo, issue };
     return { issue: executeSelection('Issue', gql, subSelection('issue'), ctx) };
   }
@@ -651,6 +653,7 @@ function resolveMutationField(_value: GqlValue, field: FieldNode, ctx: ExecConte
     hit.issue.state = 'closed';
     hit.issue.closedAt = nowIso();
     hit.issue.updatedAt = nowIso();
+    bumpIssueVersion(hit.repo);
     const gql: GqlValue = { __type: 'Issue', repo: hit.repo, issue: hit.issue };
     return { issue: executeSelection('Issue', gql, subSelection('issue'), ctx) };
   }
@@ -742,6 +745,7 @@ function resolveMutationField(_value: GqlValue, field: FieldNode, ctx: ExecConte
     if ('issue' in target) {
       target.issue.comments.push(comment);
       target.issue.updatedAt = nowIso();
+      bumpIssueVersion(target.repo);
     }
     const node: GqlValue = { __type: 'IssueComment', comment };
     const edgeSelection = subSelection('commentEdge');

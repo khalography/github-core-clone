@@ -115,6 +115,28 @@ export interface Repo {
   nextPull: number;
   nextCommentId: number;
   nextLabelId: number;
+  /**
+   * Bumped on every mutation that can change a serialized issue's JSON
+   * (issue field edits, comment adds, label adds, issue creates). The
+   * per-issue response cache in rest.ts is keyed on this version, so a
+   * stale entry can never be served. Bump it at every such site.
+   */
+  issueVersion: number;
+  /** Cached serialized single-issue JSON, per issue number. See rest.ts. */
+  issueCache: Map<number, { v: number; origin: string; text: string; len: number }>;
+  /**
+   * Bumped on every git objects/refs mutation (putObject, applyPush, ref
+   * creation). The fetch-response cache in githttp.ts is keyed on this
+   * generation, so a stale pack can never be served.
+   */
+  gitGen: number;
+  /** Cached git-upload-pack fetch responses, keyed by generation + request. */
+  fetchCache: Map<string, Buffer>;
+}
+
+/** Bump a repo's issue version: call at every mutation that can change a serialized issue's JSON. */
+export function bumpIssueVersion(repo: Repo): void {
+  repo.issueVersion += 1;
 }
 
 export class Store {
@@ -155,6 +177,10 @@ export class Store {
       nextPull: 1,
       nextCommentId: 1,
       nextLabelId: 1,
+      issueVersion: 0,
+      issueCache: new Map(),
+      gitGen: 0,
+      fetchCache: new Map(),
     };
     this.repos.set(this.repoKey(VIEWER_LOGIN, name), repo);
     return repo;
@@ -173,7 +199,11 @@ export class Store {
 
   putObject(repo: Repo, type: GitObject['type'], data: Buffer): string {
     const oid = hashObject(type, data);
-    if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data: Buffer.from(data) });
+    if (!repo.objects.has(oid)) {
+      repo.objects.set(oid, { type, data: Buffer.from(data) });
+      // A new git object changes what a fetch can return: invalidate the fetch cache.
+      repo.gitGen += 1;
+    }
     return oid;
   }
 

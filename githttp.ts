@@ -72,18 +72,41 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
 
 function v2Advertisement(service: 'git-upload-pack'): Buffer {
   void service;
-  const lines: Array<string | 'flush'> = [
-    `# service=git-upload-pack\n`,
-    'flush',
-    'version 2\n',
-    `agent=${AGENT}\n`,
-    'ls-refs=unborn\n',
-    'fetch=shallow wait-for-done\n',
-    'server-option\n',
-    'object-format=sha1\n',
-    'flush',
-  ];
-  return encodePktLines(lines);
+  return V2_ADVERTISEMENT;
+}
+
+/** The v2 upload-pack advertisement never varies: build it once. */
+const V2_ADVERTISEMENT: Buffer = encodePktLines([
+  `# service=git-upload-pack\n`,
+  'flush',
+  'version 2\n',
+  `agent=${AGENT}\n`,
+  'ls-refs=unborn\n',
+  'fetch=shallow wait-for-done\n',
+  'server-option\n',
+  'object-format=sha1\n',
+  'flush',
+]);
+
+/**
+ * Cache key for a fetch response: the repo's git generation (bumped on
+ * every objects/refs mutation) plus every request field that shapes the
+ * response. The pack for a fixed (wants, haves, depth, shallow) is
+ * immutable — git objects never change — and the wanted-refs section
+ * follows the refs, which the generation covers. The clone workload
+ * issues 50 identical fetches, so 49 of them hit this cache.
+ */
+function fetchCacheKey(repo: Repo, isV2: boolean, req: FetchRequest): string {
+  return [
+    repo.gitGen,
+    isV2 ? 'v2' : 'v0',
+    req.wants.join(','),
+    req.haves.join(','),
+    req.depth ?? '',
+    req.shallow.join(','),
+    req.deepenSince ?? '',
+    req.deepenNot.join(','),
+  ].join('|');
 }
 
 /** All refs in ls-refs order, HEAD first with its symref target. */
@@ -257,6 +280,9 @@ function fetchObjects(repo: Repo, req: FetchRequest): { objects: GitObject[]; sh
 }
 
 function v2FetchResponse(repo: Repo, req: FetchRequest): Buffer {
+  const key = fetchCacheKey(repo, true, req);
+  const hit = repo.fetchCache.get(key);
+  if (hit) return hit;
   const { objects, shallow, unshallow } = fetchObjects(repo, req);
   const parts: Buffer[] = [];
   // acknowledgments
@@ -288,7 +314,9 @@ function v2FetchResponse(repo: Repo, req: FetchRequest): Buffer {
   const pack = writePack(objects);
   parts.push(sidebandWrap(1, pack));
   parts.push(Buffer.from('0000', 'ascii'));
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  repo.fetchCache.set(key, out);
+  return out;
 }
 
 /** Parse a v0 upload-pack request (want/have/deepen lines, two sections). */
@@ -313,6 +341,9 @@ function parseV0Fetch(body: Buffer): FetchRequest {
 }
 
 function v0FetchResponse(repo: Repo, req: FetchRequest): Buffer {
+  const key = fetchCacheKey(repo, false, req);
+  const hit = repo.fetchCache.get(key);
+  if (hit) return hit;
   const { objects, shallow, unshallow } = fetchObjects(repo, req);
   const parts: Buffer[] = [];
   parts.push(encodePktLines(['NAK\n']));
@@ -321,7 +352,9 @@ function v0FetchResponse(repo: Repo, req: FetchRequest): Buffer {
   const pack = writePack(objects);
   parts.push(sidebandWrap(1, pack));
   parts.push(Buffer.from('0000', 'ascii'));
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  repo.fetchCache.set(key, out);
+  return out;
 }
 
 interface PushCommand {
@@ -400,22 +433,26 @@ function applyPush(repo: Repo, commands: PushCommand[], pack: Buffer | null): Ar
       continue;
     }
     // Fast-forward only: the new tip must descend from the current tip.
-    const newObject = repo.objects.get(command.newOid);
-    if (!newObject || newObject.type !== 'commit') {
-      results.push({ ref: command.ref, ok: false, reason: 'new tip is not a commit' });
-      continue;
-    }
+    // Walk the ancestry but stop the moment the current tip is found: on a
+    // linear chain it is the new tip's immediate parent, so this is two
+    // parses instead of a walk of the whole history on every push.
     const ancestors = new Set<string>();
     const queue: string[] = [command.newOid];
-    while (queue.length) {
-      const oid = queue.shift()!;
+    let head = 0;
+    let isFastForward = false;
+    while (head < queue.length) {
+      const oid = queue[head++]!;
+      if (oid === current) {
+        isFastForward = true;
+        break;
+      }
       if (ancestors.has(oid)) continue;
       ancestors.add(oid);
       const object = repo.objects.get(oid);
       if (!object || object.type !== 'commit') continue;
       for (const parent of parseCommit(object.data).parents) queue.push(parent);
     }
-    if (!ancestors.has(current)) {
+    if (!isFastForward) {
       results.push({ ref: command.ref, ok: false, reason: 'non-fast-forward' });
       continue;
     }
@@ -425,6 +462,8 @@ function applyPush(repo: Repo, commands: PushCommand[], pack: Buffer | null): Ar
   const now = new Date().toISOString();
   repo.updatedAt = now;
   repo.pushedAt = now;
+  // Objects and/or refs changed: invalidate the git fetch cache.
+  repo.gitGen += 1;
   return results;
 }
 

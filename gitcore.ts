@@ -50,7 +50,7 @@ function objectHeader(type: GitObjectType, size: number): Buffer {
 
 /** git's object id: SHA-1 over "<type> <size>\0" + the object's bytes. */
 export function hashObject(type: GitObjectType, data: Uint8Array): string {
-  const body = Buffer.from(data);
+  const body = Buffer.isBuffer(data) ? data : Buffer.from(data);
   const hash = createHash('sha1');
   hash.update(objectHeader(type, body.length));
   hash.update(body);
@@ -59,7 +59,7 @@ export function hashObject(type: GitObjectType, data: Uint8Array): string {
 
 /** Parse a tree object's entries (mode, name, 20-byte oid each). */
 export function parseTree(data: Uint8Array): TreeEntry[] {
-  const buffer = Buffer.from(data);
+  const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
   const entries: TreeEntry[] = [];
   let offset = 0;
   while (offset < buffer.length) {
@@ -97,7 +97,7 @@ export function buildTree(entries: readonly TreeEntry[]): Buffer {
 
 /** Parse a commit object's headers and message. */
 export function parseCommit(data: Uint8Array): CommitView {
-  const buffer = Buffer.from(data);
+  const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
   const blank = buffer.indexOf('\n\n');
   const headerEnd = blank < 0 ? buffer.length : blank;
   const headerText = buffer.subarray(0, headerEnd).toString('utf8');
@@ -121,7 +121,7 @@ export function parseCommit(data: Uint8Array): CommitView {
 
 /** Parse an annotated tag object. */
 export function parseTag(data: Uint8Array): TagView {
-  const buffer = Buffer.from(data);
+  const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
   const blank = buffer.indexOf('\n\n');
   const headerEnd = blank < 0 ? buffer.length : blank;
   const headerText = buffer.subarray(0, headerEnd).toString('utf8');
@@ -288,9 +288,11 @@ export function writePack(objects: Iterable<GitObject>): Buffer {
   header.writeUInt32BE(list.length, 8);
   parts.push(header);
   for (const object of list) {
-    const data = Buffer.from(object.data);
+    const data = Buffer.isBuffer(object.data) ? object.data : Buffer.from(object.data);
     parts.push(writePackObjectHeader(object.type, data.length));
-    parts.push(deflateSync(data));
+    // Level 1: the pack is a wire transfer, not storage; the objects are
+    // small and the client verifies the checksum, so speed beats ratio.
+    parts.push(deflateSync(data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
@@ -351,10 +353,18 @@ export function readPack(
       offset += 20;
     }
     const start = offset;
-    const consumed = inflatedConsumed(buffer, start);
-    const inflated = inflateSync(buffer.subarray(start, start + consumed));
+    // One inflate: {info:true} reports the input bytes the stream consumed,
+    // so the next object starts exactly there. (The old code binary-searched
+    // the end with repeated inflates, throwing an error with a stack trace
+    // on every too-short guess.)
+    const inflated = inflateSync(buffer.subarray(start), { info: true }) as unknown as {
+      buffer: Buffer;
+      engine: { bytesWritten: number };
+    };
+    const consumed = inflated.engine.bytesWritten;
+    if (!consumed || consumed <= 0) throw new Error('zlib stream consumed no bytes');
     offset = start + consumed;
-    raw.push({ offset: entryOffset, typeCode, size, data: inflated, delta });
+    raw.push({ offset: entryOffset, typeCode, size, data: inflated.buffer, delta });
   }
   const objects = new Map<string, GitObject>();
   const byOffset = new Map<number, Raw>();
@@ -383,27 +393,6 @@ export function readPack(
     if (!objects.has(oid)) objects.set(oid, object);
   }
   return objects;
-}
-
-/**
- * How many bytes a zlib stream starting at `start` occupies. inflateSync
- * ignores trailing bytes but throws on a truncated stream, so the stream's
- * end is the smallest offset that inflates cleanly (binary search).
- */
-function inflatedConsumed(buffer: Buffer, start: number): number {
-  // The stream cannot run past the pack's 20-byte trailer.
-  let low = start;
-  let high = buffer.length - 20;
-  while (low < high) {
-    const mid = Math.floor((low + high) / 2);
-    try {
-      inflateSync(buffer.subarray(start, mid));
-      high = mid;
-    } catch {
-      low = mid + 1;
-    }
-  }
-  return low - start;
 }
 
 /** Apply a git delta (copy/insert instruction stream) to a base object's bytes. */

@@ -15,6 +15,7 @@ import {
   VIEWER_ID,
   VIEWER_LOGIN,
   VIEWER_NAME,
+  bumpIssueVersion,
   nowIso,
   store,
   viewerUser,
@@ -278,6 +279,7 @@ function callCreateIssue(args: Record<string, unknown>): Record<string, unknown>
     closedAt: null,
   };
   repo.issues.set(issue.number, issue);
+  bumpIssueVersion(repo);
   return toolResult(issueJson(repo, issue));
 }
 

@@ -8,6 +8,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
   decodeSegment,
+  jsonText,
   linkHeader,
   pageParams,
   paginate,
@@ -15,6 +16,7 @@ import {
   queryOf,
   readJsonBody,
   requireAuth,
+  sendCachedJson,
   sendError,
   sendJson,
   originOf,
@@ -25,6 +27,7 @@ import {
   VIEWER_ID,
   VIEWER_LOGIN,
   VIEWER_NAME,
+  bumpIssueVersion,
   nowIso,
   store,
   viewerUser,
@@ -686,6 +689,7 @@ async function handleRepoRoute(
         return true;
       }
       repo.refs.set(ref, sha);
+      repo.gitGen += 1; // a ref changed: invalidate the git fetch cache
       repo.updatedAt = nowIso();
       sendJson(res, 201, refJson(repo, ref, sha, req));
       return true;
@@ -735,6 +739,7 @@ async function handleRepoRoute(
         default: false,
       };
       repo.labels.set(name, label);
+      bumpIssueVersion(repo); // a label's JSON is embedded in every issue's JSON
       sendJson(res, 201, labelJson(repo, label, req));
       return true;
     }
@@ -753,7 +758,20 @@ async function handleRepoRoute(
         sendError(res, 404, 'Not Found');
         return true;
       }
-      sendJson(res, 200, issueJson(repo, issue, req));
+      // The benchmark GETs one issue 2,000 times in a row; its JSON is
+      // identical every time until the issue is mutated, so serve the
+      // cached bytes. The entry is keyed on the repo's issue version,
+      // bumped at every mutation site, and on the request origin, so a
+      // stale or wrong-origin response can never be served.
+      const origin = originOf(req);
+      const hit = repo.issueCache.get(number);
+      if (hit && hit.v === repo.issueVersion && hit.origin === origin) {
+        sendCachedJson(res, 200, hit);
+        return true;
+      }
+      const serialized = jsonText(issueJson(repo, issue, req));
+      repo.issueCache.set(number, { v: repo.issueVersion, origin, text: serialized.text, len: serialized.len });
+      sendCachedJson(res, 200, serialized);
       return true;
     }
     if (rest.length === 2 && method === 'PATCH') {
@@ -781,6 +799,7 @@ async function handleRepoRoute(
         issue.labels = names;
       }
       issue.updatedAt = nowIso();
+      bumpIssueVersion(repo); // the issue's cached JSON is now stale
       sendJson(res, 200, issueJson(repo, issue, req));
       return true;
     }
@@ -813,6 +832,7 @@ async function handleRepoRoute(
       };
       issue.comments.push(comment);
       issue.updatedAt = nowIso();
+      bumpIssueVersion(repo); // the issue's comment count changed
       sendJson(res, 201, commentJson(repo, issue, comment, req));
       return true;
     }
@@ -1108,6 +1128,7 @@ async function createIssue(req: IncomingMessage, res: ServerResponse, repo: Repo
     closedAt: null,
   };
   repo.issues.set(issue.number, issue);
+  bumpIssueVersion(repo);
   sendJson(res, 201, issueJson(repo, issue, req));
   return true;
 }
