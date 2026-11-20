@@ -22,7 +22,7 @@ import {
   ZERO_OID,
   type GitObject,
 } from './gitcore.ts';
-import { decodeSegment, pathOf, readBody, sendError, sendRaw } from './http.ts';
+import { decodeSegment, pathOf, queryOf, readBody, sendError, sendRaw } from './http.ts';
 import { DEFAULT_BRANCH, store, type Repo } from './store.ts';
 
 const AGENT = 'forge/1.0';
@@ -68,6 +68,33 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
   void contentType;
   const lines: Array<string | 'flush'> = [`# service=${service}\n`, 'flush', ...v0RefLines(repo), 'flush'];
   return encodePktLines(lines);
+}
+
+/**
+ * The v0 advertisement for a service, cached per git generation. The push
+ * workload fetches the receive-pack advertisement before every push, and
+ * the clone workload fetches the upload-pack one before every clone; the
+ * refs only change when gitGen bumps, so the cached bytes stay correct.
+ */
+function v0AdvertisementCached(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  const hit = repo.v0AdvertCache.get(service);
+  if (hit && hit.gen === repo.gitGen) return hit.buf;
+  const buf = v0Advertisement(repo, service);
+  repo.v0AdvertCache.set(service, { gen: repo.gitGen, buf });
+  return buf;
+}
+
+/** The encoded ls-refs response for one option set, cached per git generation. */
+function lsRefsResponseCached(
+  repo: Repo,
+  opts: { peel: boolean; symrefs: boolean; unborn: boolean; prefixes: string[] },
+): Buffer {
+  const key = [opts.peel ? 'p' : '', opts.symrefs ? 's' : '', opts.unborn ? 'u' : '', opts.prefixes.join(',')].join('|');
+  const hit = repo.lsRefsCache.get(key);
+  if (hit && hit.gen === repo.gitGen) return hit.buf;
+  const buf = encodePktLines([...lsRefsLines(repo, opts), 'flush']);
+  repo.lsRefsCache.set(key, { gen: repo.gitGen, buf });
+  return buf;
 }
 
 function v2Advertisement(service: 'git-upload-pack'): Buffer {
@@ -396,7 +423,9 @@ function applyPush(repo: Repo, commands: PushCommand[], pack: Buffer | null): Ar
   if (pack !== null && pack.length > 0) {
     const objects = readPack(pack);
     for (const [oid, object] of objects) {
-      if (!repo.objects.has(oid)) repo.objects.set(oid, { type: object.type, data: Buffer.from(object.data) });
+      // readPack's inflateSync returns a fresh Buffer per object, so the
+      // data is already detached from the pack; no copy is needed.
+      if (!repo.objects.has(oid)) repo.objects.set(oid, { type: object.type, data: object.data });
     }
   }
   const results: Array<{ ref: string; ok: boolean; reason: string }> = [];
@@ -502,16 +531,15 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse): Prom
 
   // GET /info/refs?service=...
   if (tail.startsWith('info/refs') && method === 'GET') {
-    const url = new URL(req.url ?? '/', 'http://entry');
-    const service = url.searchParams.get('service') ?? '';
+    const service = queryOf(req).get('service') ?? '';
     if (service === 'git-upload-pack') {
       const wantsV2 = (req.headers['git-protocol'] ?? '') === 'version=2';
-      const body = wantsV2 ? v2Advertisement('git-upload-pack') : v0Advertisement(repo, 'git-upload-pack');
+      const body = wantsV2 ? v2Advertisement('git-upload-pack') : v0AdvertisementCached(repo, 'git-upload-pack');
       sendRaw(res, 200, body, UPLOAD_ADVERTISEMENT);
       return true;
     }
     if (service === 'git-receive-pack') {
-      sendRaw(res, 200, v0Advertisement(repo, 'git-receive-pack'), RECEIVE_ADVERTISEMENT);
+      sendRaw(res, 200, v0AdvertisementCached(repo, 'git-receive-pack'), RECEIVE_ADVERTISEMENT);
       return true;
     }
     sendError(res, 400, 'unknown service');
@@ -529,8 +557,7 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse): Prom
         const symrefs = args.includes('symrefs');
         const unborn = args.includes('unborn');
         const prefixes = args.filter((a) => a.startsWith('ref-prefix ')).map((a) => a.slice('ref-prefix '.length));
-        const lines = lsRefsLines(repo, { peel, symrefs, unborn, prefixes });
-        sendRaw(res, 200, encodePktLines([...lines, 'flush']), UPLOAD_RESULT);
+        sendRaw(res, 200, lsRefsResponseCached(repo, { peel, symrefs, unborn, prefixes }), UPLOAD_RESULT);
         return true;
       }
       if (command === 'fetch') {

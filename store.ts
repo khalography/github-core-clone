@@ -122,8 +122,8 @@ export interface Repo {
    * stale entry can never be served. Bump it at every such site.
    */
   issueVersion: number;
-  /** Cached serialized single-issue JSON, per issue number. See rest.ts. */
-  issueCache: Map<number, { v: number; origin: string; text: string; len: number }>;
+  /** Cached serialized single-issue JSON (pre-encoded wire bytes), per issue number. See rest.ts. */
+  issueCache: Map<number, { v: number; origin: string; buf: Buffer; len: number }>;
   /**
    * Bumped on every git objects/refs mutation (putObject, applyPush, ref
    * creation). The fetch-response cache in githttp.ts is keyed on this
@@ -132,6 +132,19 @@ export interface Repo {
   gitGen: number;
   /** Cached git-upload-pack fetch responses, keyed by generation + request. */
   fetchCache: Map<string, Buffer>;
+  /**
+   * Cached v0 ref advertisements (info/refs), keyed by service; each entry
+   * records the gitGen it was built at, so a refs change invalidates it.
+   * The push workload fetches the receive-pack advertisement before every
+   * push, and the refs do not change between pushes on the same repo.
+   */
+  v0AdvertCache: Map<string, { gen: number; buf: Buffer }>;
+  /**
+   * Cached v2 ls-refs responses (already pkt-line encoded), keyed by
+   * generation + the request options that shape them. The clone workload
+   * issues an identical ls-refs before every fetch.
+   */
+  lsRefsCache: Map<string, { gen: number; buf: Buffer }>;
 }
 
 /** Bump a repo's issue version: call at every mutation that can change a serialized issue's JSON. */
@@ -181,6 +194,8 @@ export class Store {
       issueCache: new Map(),
       gitGen: 0,
       fetchCache: new Map(),
+      v0AdvertCache: new Map(),
+      lsRefsCache: new Map(),
     };
     this.repos.set(this.repoKey(VIEWER_LOGIN, name), repo);
     return repo;

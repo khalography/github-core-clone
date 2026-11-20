@@ -16,6 +16,12 @@ let requestCounter = 0;
 // (The old code drew fresh crypto randomness for every response.)
 const requestPrefix = randomBytes(4).toString('hex');
 
+// The bearer token, read once at module load: requireAuth runs on every
+// REST/GraphQL/MCP request, and a process.env lookup per request is
+// needless work. (The token is set before the process starts and never
+// changes while it runs.)
+const EXPECTED_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+
 export function requestId(): string {
   requestCounter += 1;
   return `req_${requestPrefix}_${requestCounter}`;
@@ -27,30 +33,34 @@ export function sendJson(
   body: unknown,
   headers: Readonly<Record<string, string>> = {},
 ): void {
-  const text = `${JSON.stringify(body)}\n`;
+  // Encode once: Buffer.byteLength(text) scans the string and res.end(text)
+  // would encode it again. A single Buffer.from gives the length for free
+  // and res.end sends the bytes directly.
+  const buf = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
   res.writeHead(status, {
     'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
+    'content-length': buf.length,
     'x-github-request-id': requestId(),
     ...headers,
   });
-  res.end(text);
+  res.end(buf);
 }
 
 /**
  * Serialize a JSON body exactly as sendJson does, returning the wire bytes
- * and their length, so a caller can cache and re-send them.
+ * (pre-encoded once) and their length, so a caller can cache and re-send them
+ * without paying the UTF-8 encode on every repeat.
  */
-export function jsonText(body: unknown): { text: string; len: number } {
-  const text = `${JSON.stringify(body)}\n`;
-  return { text, len: Buffer.byteLength(text) };
+export function jsonText(body: unknown): { buf: Buffer; len: number } {
+  const buf = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
+  return { buf, len: buf.length };
 }
 
 /** Send pre-serialized JSON bytes with exactly the headers sendJson sets. */
 export function sendCachedJson(
   res: ServerResponse,
   status: number,
-  cached: { text: string; len: number },
+  cached: { buf: Buffer; len: number },
   headers: Readonly<Record<string, string>> = {},
 ): void {
   res.writeHead(status, {
@@ -59,7 +69,7 @@ export function sendCachedJson(
     'x-github-request-id': requestId(),
     ...headers,
   });
-  res.end(cached.text);
+  res.end(cached.buf);
 }
 
 export function sendRaw(
@@ -148,10 +158,9 @@ export function bearerToken(req: IncomingMessage): string | null {
 
 /** True when the request carries the forge's token (or when no token is configured, dev mode). */
 export function isAuthenticated(req: IncomingMessage): boolean {
-  const expected = process.env.MAKEFUN_SHOP_TOKEN ?? '';
-  if (expected === '') return true;
+  if (EXPECTED_TOKEN === '') return true;
   const presented = bearerToken(req);
-  return presented !== null && presented === expected;
+  return presented !== null && presented === EXPECTED_TOKEN;
 }
 
 /** Answer 401 unless the request is authenticated; returns true when it may proceed. */

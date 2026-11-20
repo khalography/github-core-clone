@@ -770,7 +770,7 @@ async function handleRepoRoute(
         return true;
       }
       const serialized = jsonText(issueJson(repo, issue, req));
-      repo.issueCache.set(number, { v: repo.issueVersion, origin, text: serialized.text, len: serialized.len });
+      repo.issueCache.set(number, { v: repo.issueVersion, origin, buf: serialized.buf, len: serialized.len });
       sendCachedJson(res, 200, serialized);
       return true;
     }
